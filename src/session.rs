@@ -246,6 +246,14 @@ async fn run(
             }
         }
     }
+
+    // Close all receive flows when the connection closes
+    debug!("closing all receive flows");
+    let flows = receive_flows.lock().await;
+    for (flow_id, flow) in flows.iter() {
+        debug!(%flow_id, "cancelling receive flow");
+        flow.cancel_token.cancel();
+    }
 }
 
 /// Async read based reading of a `VarInt`.
@@ -390,6 +398,58 @@ mod tests {
             let incoming = recv_flow.read_rtp().await?;
             assert_eq!(packet, incoming);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_receive_flow_closed_on_connection_close() -> Result<()> {
+        let ep1 = Endpoint::builder()
+            .bind_addr_v4("127.0.0.1:0".parse().unwrap())
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+        let ep2 = Endpoint::builder()
+            .bind_addr_v4("127.0.0.1:0".parse().unwrap())
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+
+        let flow_id = VarInt::from_u32(0);
+
+        let ep2_addr = ep2.addr();
+
+        let _handle = task::spawn(async move {
+            while let Some(incoming) = ep2.accept().await {
+                if let Ok(connection) = incoming.await {
+                    assert_eq!(connection.alpn(), ALPN, "invalid ALPN");
+
+                    let session = Session::new(connection);
+                    let _send_flow = session.new_send_flow(flow_id).await.unwrap();
+                    let _recv_flow = session.new_receive_flow(flow_id).await.unwrap();
+
+                    // Keep session alive for a bit
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+        });
+
+        let conn = ep1.connect(ep2_addr, ALPN).await?;
+
+        let session = Session::new(conn.clone());
+        let recv_flow = session.new_receive_flow(flow_id).await.unwrap();
+
+        // Verify flow is not closed initially
+        assert!(!recv_flow.is_closed());
+
+        // Close the connection
+        conn.close(0u32.into(), b"test close");
+
+        // Wait for the connection to close and flows to be cleaned up
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Verify the receive flow is now closed
+        assert!(recv_flow.is_closed());
 
         Ok(())
     }
